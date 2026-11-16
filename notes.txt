@@ -1,0 +1,14 @@
+CSE 614 - Computer Networks Lab - quick notes
+
+TCP is a byte stream. One recv() call is not one message, so the server reads
+until it sees the blank line (\r\n\r\n) that ends the HTTP headers.
+
+HTTP status codes used by this server:
+  200 OK          - file found and sent
+  302 Found       - "I'm Feeling Lucky" redirect to the first search result
+  403 Forbidden   - path tried to escape the web root (e.g. /../../secret.txt)
+  404 Not Found   - no such file
+  405 Not Allowed - anything other than GET
+
+The Content-Type header tells the browser whether the body is HTML, plain
+text, or an image such as Cat.webp.
