@@ -1,23 +1,19 @@
 """
-Socket Web Client with File Search — CSE 614
-Run this on the CLIENT laptop.
+Socket web client with file search (CSE 614).
+Run on the client machine:  python web_client.py <SERVER_IP> [PORT]
 
-Usage:  python web_client.py <SERVER_IP> [PORT]
-Example:
     python web_client.py 192.168.0.105
-    python web_client.py                  (defaults to 127.0.0.1, same-PC test)
+    python web_client.py              (defaults to 127.0.0.1)
 
-At the prompt you can type:
-    search cat     -> ask the server which files match "cat"
-    ?cat           -> same thing, shorter
-    search         -> empty search = list everything on the server
-    1, 2, 3 ...    -> open result number N from the last search
-    /index.html    -> fetch a file by path, like the original client
-    /Cat.webp      -> an image, saved into downloads/
-Press Enter on an empty line to quit.
+At the prompt:
+    search cat     files matching "cat"
+    ?cat           shorthand for the above
+    search         list every file on the server
+    1, 2, 3 ...    open result N from the last search
+    /index.html    fetch a path directly
+Empty line quits. Images and other binaries are saved to downloads/.
 
-The client still builds every HTTP request by hand and sends it over a raw
-socket. A search is just another GET: GET /api/search?q=cat HTTP/1.1.
+Requests are built by hand and sent over a raw socket.
 """
 
 import json
@@ -30,31 +26,25 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 TIMEOUT = 5.0                                    # seconds to wait on the server
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
-PREVIEW_CHARS = 800                              # how much of a text body to print
+PREVIEW_CHARS = 800                              # max characters of a text body to print
 
 
 def build_request(host: str, port: int, path: str) -> bytes:
-    """
-    Hand-build a raw HTTP GET request. No libraries -- this is the point of the
-    exercise. A GET has no body, so the request is just the request line, some
-    headers, and the blank line that ends them.
-
-    The Host header is what lets one server serve many sites from one IP, and
-    HTTP/1.1 requires it.
-    """
+    """Build a raw HTTP GET request. A GET has no body, so it is just the
+    request line, headers and the blank line that ends them."""
     request_text = (
         f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
+        f"Host: {host}:{port}\r\n"               # required by HTTP/1.1
         f"User-Agent: PythonSocketClient/3.0-search\r\n"
         f"Accept: */*\r\n"
-        f"Connection: close\r\n"
+        f"Connection: close\r\n"                 # server hangs up after replying
         f"\r\n"
     )
     return request_text.encode()
 
 
 def parse_headers(header_text: str) -> dict:
-    """Turn the header block into a lowercase-keyed dict. Status line excluded."""
+    """Header lines as a dict with lowercase names. Skips the status line."""
     headers = {}
     for line in header_text.split("\r\n")[1:]:
         name, sep, value = line.partition(":")
@@ -64,25 +54,18 @@ def parse_headers(header_text: str) -> dict:
 
 
 def receive_full_response(sock: socket.socket) -> bytes:
-    """
-    Read the whole response.
-
-    Same byte-stream problem the server has: one recv() is not guaranteed to
-    give us everything. A 287 KB image arrives as dozens of chunks. We asked for
-    "Connection: close", so the server hangs up when it is done -- recv()
-    returning b"" is our end-of-message marker.
-    """
+    """Read until the server closes the connection."""
     chunks = []
     while True:
-        chunk = sock.recv(4096)
-        if not chunk:                # b"" means the server closed its end
+        chunk = sock.recv(4096)      # one recv() may return only part of the reply
+        if not chunk:                # empty bytes = server closed, reply is complete
             break
         chunks.append(chunk)
     return b"".join(chunks)
 
 
 def save_body(path: str, body: bytes) -> Path:
-    """Write a downloaded file into downloads/, named after the URL path."""
+    """Save a downloaded body into downloads/, named after the URL path."""
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     name = Path(unquote(path.split("?", 1)[0])).name or "index.html"
     out_path = DOWNLOAD_DIR / name
@@ -91,21 +74,18 @@ def save_body(path: str, body: bytes) -> Path:
 
 
 def http_get(host: str, port: int, path: str, show_request: bool = True) -> tuple[str, dict, bytes] | None:
-    """
-    Open a connection, send one GET, read the whole reply, close.
-    Returns (header text, header dict, body), or None if the server sent nothing.
-    """
+    """Send one GET and return (header text, header dict, body).
+    Returns None if the server closed without answering."""
     request = build_request(host, port, path)
 
     if show_request:
         print("\n--- Raw HTTP request sent ---")
         print(request.decode(errors="replace"))
 
-    # A fresh socket per request, because the server replies with
-    # "Connection: close" and hangs up after every response.
+    # new socket per request because the server closes after each response
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
         client_socket.settimeout(TIMEOUT)
-        client_socket.connect((host, port))       # the TCP three-way handshake
+        client_socket.connect((host, port))       # TCP handshake happens here
         client_socket.sendall(request)
         response = receive_full_response(client_socket)
 
@@ -113,15 +93,14 @@ def http_get(host: str, port: int, path: str, show_request: bool = True) -> tupl
         print("[!] The server closed the connection without answering.")
         return None
 
-    # Headers and body are separated by one blank line -- the same rule the
-    # server uses when it builds the response.
+    # a blank line separates the headers from the body
     header_bytes, _, body = response.partition(b"\r\n\r\n")
     header_text = header_bytes.decode(errors="replace")
     return header_text, parse_headers(header_text), body
 
 
 def fetch(host: str, port: int, path: str) -> None:
-    """GET one path and show the answer: print text, save anything binary."""
+    """GET one path. Print text bodies, save binary ones."""
     reply = http_get(host, port, path)
     if reply is None:
         return
@@ -146,8 +125,7 @@ def fetch(host: str, port: int, path: str) -> None:
             print(f"... ({len(text) - PREVIEW_CHARS} more characters)")
         print("-" * 55)
     elif body:
-        # Not text -- an image or some other binary file. Printing it would just
-        # spray control characters at the terminal, so save it instead.
+        # binary data would only garble the terminal, so write it to disk
         saved = save_body(path, body)
         print(f"Saved  : {saved}")
 
@@ -161,12 +139,9 @@ def human_size(n: int) -> str:
 
 
 def search(host: str, port: int, query: str) -> list[dict]:
-    """
-    Ask the server which files match `query`. This is an ordinary GET to
-    /api/search; the server answers with JSON instead of an HTML page.
-    Returns the list of results so the user can open one by number.
-    """
-    path = "/api/search?q=" + quote(query)
+    """Query /api/search and print the matches.
+    Returns the result list so a result can be opened by number."""
+    path = "/api/search?q=" + quote(query)   # quote() escapes spaces and symbols
     reply = http_get(host, port, path)
     if reply is None:
         return []
@@ -209,7 +184,7 @@ def main() -> None:
     print("  Empty line quits.")
     print("=" * 55)
 
-    last_results: list[dict] = []
+    last_results: list[dict] = []    # results of the most recent search
 
     while True:
         try:

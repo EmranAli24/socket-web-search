@@ -1,28 +1,17 @@
 """
-Socket Web Server with File Search — CSE 614
-Run this on the SERVER laptop.
+Socket web server with file search (CSE 614).
+Run on the server machine:  python web_server.py
 
-Usage:  python web_server.py
+Built on raw TCP sockets, no http.server or frameworks.
 
-This is socket-web-client-server/web_server.py plus a search engine for the
-files it serves. It is still built on raw TCP sockets: no http.server, no
-frameworks. Every response is assembled by hand in build_response().
+Routes:
+    GET /                  search home page
+    GET /search?q=cat      results page (empty q lists every file)
+    GET /lucky?q=cat       302 redirect to the first result
+    GET /api/search?q=cat  results as JSON (used by web_client.py)
+    GET /<file>            the file itself
 
-What the server answers:
-
-    GET /                  -> search home page (type a query, press Search)
-    GET /search?q=cat      -> results page listing matching files
-    GET /search?q=         -> empty query = list ALL server content
-    GET /lucky?q=cat       -> 302 redirect straight to the first result
-    GET /api/search?q=cat  -> the same results as JSON (used by web_client.py)
-    GET /index.html        -> the file itself (what clicking a result does)
-    GET /Cat.webp          -> the image itself
-
-Two ways to test it:
-    1. a browser at http://<SERVER_IP>:8080          (the search page)
-    2. python web_client.py <SERVER_IP>              (type: search cat)
-
-Stop it with Ctrl+C.
+Stop with Ctrl+C.
 """
 
 import html
@@ -35,27 +24,23 @@ from email.utils import formatdate
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
-HOST = ""                          # "" means listen on all network interfaces
+HOST = ""                          # empty string = listen on all interfaces
 PORT = 8080
-WEB_ROOT = Path(__file__).parent   # files are served from this folder only
+WEB_ROOT = Path(__file__).parent   # only files under this folder are served
 CLIENT_TIMEOUT = 3.0               # seconds to wait for a silent client
-MAX_TEXT_SEARCH = 1_000_000        # only search inside text files below 1 MB
+MAX_TEXT_SEARCH = 1_000_000        # skip content search in text files over 1 MB
 
-# Never list these in search results. The server should not advertise its own
-# source code, and downloads/ is where the client saves things.
+# Hidden from search and never served: our own source and the client's download folder
 SKIP_DIRS = {"__pycache__", "downloads"}
 SKIP_SUFFIXES = {".py", ".pyc"}
 
 
-# --------------------------------------------------------------------------
-# HTTP basics (same as the original server)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------- HTTP helpers
 
 def build_response(status_line: str, body: bytes, content_type: str = "text/html",
                    extra_headers: dict | None = None) -> bytes:
-    """Glue a status line + headers + blank line + body into raw HTTP bytes."""
-    # charset only makes sense for text. Saying "image/webp; charset=utf-8"
-    # would be nonsense -- an image is bytes, not characters.
+    """Join status line, headers, blank line and body into raw HTTP bytes."""
+    # charset only applies to text types, not images
     if content_type.startswith("text/") or content_type == "application/json":
         content_type += "; charset=utf-8"
 
@@ -64,32 +49,24 @@ def build_response(status_line: str, body: bytes, content_type: str = "text/html
     headers = (
         f"{status_line}\r\n"
         f"Content-Type: {content_type}\r\n"
-        f"Content-Length: {len(body)}\r\n"
+        f"Content-Length: {len(body)}\r\n"   # lets the client know where the body ends
         f"{extra}"
-        f"Connection: close\r\n"
+        f"Connection: close\r\n"             # one request per connection
         f"Date: {formatdate(usegmt=True)}\r\n"
         f"Server: PythonSocketServer/3.0-search\r\n"
-        f"\r\n"
+        f"\r\n"                              # blank line ends the headers
     )
     return headers.encode() + body
 
 
 def receive_request_headers(conn: socket.socket) -> str | None:
-    """
-    Read one complete HTTP request header block from a TCP connection.
-
-    TCP is a *byte stream*: it has no idea where one message ends and the next
-    begins. A single recv() may hand us half the request line, or the whole
-    request, or anything in between. So we keep reading until we see the blank
-    line "\r\n\r\n" that marks the end of the headers.
-
-    Returns the header text, or None if the client hung up without sending
-    anything.
-    """
+    """Read from the socket until the blank line that ends the request headers.
+    Returns None if the client closed without sending anything."""
     buffer = b""
+    # TCP is a byte stream, so one recv() may return only part of the request
     while b"\r\n\r\n" not in buffer:
         chunk = conn.recv(4096)
-        if not chunk:                  # b"" means the client closed its end
+        if not chunk:                  # empty bytes = client closed its side
             return None if not buffer else buffer.decode(errors="replace")
         buffer += chunk
 
@@ -98,7 +75,7 @@ def receive_request_headers(conn: socket.socket) -> str | None:
 
 
 def parse_headers(header_text: str) -> dict:
-    """Turn the header block into a lowercase-keyed dict. Request line excluded."""
+    """Header lines as a dict with lowercase names. Skips the request line."""
     headers = {}
     for line in header_text.split("\r\n")[1:]:
         name, sep, value = line.partition(":")
@@ -108,13 +85,12 @@ def parse_headers(header_text: str) -> dict:
 
 
 def resolve_path(url_path: str) -> Path | None:
-    """Map a URL path to a file inside WEB_ROOT. None if it escapes the root."""
-    # Browsers send "My File.txt" as "My%20File.txt", so decode first.
-    url_path = unquote(url_path)
+    """Map a URL path to a file under WEB_ROOT, or None if it points outside."""
+    url_path = unquote(url_path)       # "My%20File.txt" -> "My File.txt"
 
     candidate = (WEB_ROOT / url_path.lstrip("/")).resolve()
 
-    # Refuse anything outside WEB_ROOT, e.g. GET /../../secret.txt
+    # blocks requests like /../../secret.txt
     if not candidate.is_relative_to(WEB_ROOT.resolve()):
         return None
     return candidate
@@ -136,18 +112,17 @@ def human_size(n: int) -> str:
     return f"{n} bytes"
 
 
-# --------------------------------------------------------------------------
-# The search engine
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------- search
 
 def list_server_files() -> list[Path]:
-    """Every file the server is willing to show, sorted by name."""
+    """All files the server will show, sorted by relative path."""
     root = WEB_ROOT.resolve()
     files = []
     for p in root.rglob("*"):
         rel = p.relative_to(root)
         if not p.is_file():
             continue
+        # skip dotfiles/dot-folders and the hidden folders above
         if any(part.startswith(".") or part in SKIP_DIRS for part in rel.parts):
             continue
         if p.suffix.lower() in SKIP_SUFFIXES:
@@ -157,19 +132,20 @@ def list_server_files() -> list[Path]:
 
 
 def read_plain_text(path: Path, ctype: str) -> str:
-    """The searchable text of a file. HTML tags are stripped so we match words, not markup."""
+    """Searchable text of a file. Empty for binaries and oversized files."""
     if not is_text_type(ctype) or path.stat().st_size > MAX_TEXT_SEARCH:
         return ""
     text = path.read_text(encoding="utf-8", errors="replace")
     if ctype == "text/html":
+        # drop script/style/title blocks, then the remaining tags, so we match words not markup
         text = re.sub(r"<(script|style|title)\b.*?</\1>", " ", text, flags=re.S | re.I)
         text = re.sub(r"<[^>]+>", " ", text)
         text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", text).strip()   # collapse whitespace
 
 
 def make_snippet(text: str, words: list[str], width: int = 160) -> str:
-    """A short excerpt of `text` around the first query word that appears in it."""
+    """Excerpt of `text` starting just before the earliest query word."""
     if not text:
         return ""
     lower = text.lower()
@@ -184,19 +160,17 @@ def make_snippet(text: str, words: list[str], width: int = 160) -> str:
 
 
 def highlight(text: str, words: list[str]) -> str:
-    """HTML-escape `text`, then wrap every query word in <b>...</b>."""
+    """Escape `text` for HTML and wrap each query word in <b>."""
     escaped = html.escape(text)
+    # longest words first so a short word does not split a longer match
     for w in sorted(set(words), key=len, reverse=True):
         escaped = re.sub(f"({re.escape(html.escape(w))})", r"<b>\1</b>", escaped, flags=re.I)
     return escaped
 
 
 def search_files(query: str) -> list[dict]:
-    """
-    Find files whose name or (for text files) content contains every word of
-    the query, case-insensitive. Empty query = every file.
-    Filename matches are ranked above content-only matches.
-    """
+    """Files whose name, title or text contains every query word (case-insensitive).
+    An empty query matches everything. Name matches rank above content-only matches."""
     words = query.lower().split()
     root = WEB_ROOT.resolve()
     results = []
@@ -209,6 +183,7 @@ def search_files(query: str) -> list[dict]:
 
         name_lower = rel.lower() + " " + title.lower()
         text_lower = text.lower()
+        # every word must appear in the name/title or in the body
         if not all(w in name_lower or w in text_lower for w in words):
             continue
 
@@ -220,7 +195,7 @@ def search_files(query: str) -> list[dict]:
             "size": path.stat().st_size,
             "snippet": make_snippet(text, words),
             "title": title or path.name,
-            "_score": name_hits,
+            "_score": name_hits,       # only used for sorting, removed below
         })
 
     results.sort(key=lambda r: (-r["_score"], r["name"].lower()))
@@ -230,17 +205,15 @@ def search_files(query: str) -> list[dict]:
 
 
 def extract_title(path: Path, ctype: str) -> str:
-    """For HTML files, the <title> text; otherwise empty."""
+    """The <title> of an HTML file, or an empty string."""
     if ctype != "text/html":
         return ""
-    head = path.read_text(encoding="utf-8", errors="replace")[:4096]
+    head = path.read_text(encoding="utf-8", errors="replace")[:4096]   # title is near the top
     m = re.search(r"<title[^>]*>(.*?)</title>", head, flags=re.S | re.I)
     return html.unescape(m.group(1)).strip() if m else ""
 
 
-# --------------------------------------------------------------------------
-# HTML pages (built as strings, no templates, no external files)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------- HTML pages
 
 PAGE_CSS = """
 :root { --ink:#202124; --muted:#5f6368; --link:#1a0dab; --url:#188038;
@@ -295,6 +268,7 @@ LOGO = '<span class="logo">Socket<span>Search</span></span>'
 
 
 def page(title: str, body_class: str, body: str) -> bytes:
+    """Wrap a body fragment in a full HTML document with the shared CSS."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -310,6 +284,7 @@ def page(title: str, body_class: str, body: str) -> bytes:
 
 
 def search_box(query: str = "") -> str:
+    # the form is a plain GET, so submitting it requests /search?q=...
     return (f'<form class="box" action="/search" method="get" role="search">'
             f'<input name="q" value="{html.escape(query)}" placeholder="Search files on this server"'
             f' aria-label="Search" autocomplete="off">'
@@ -360,9 +335,11 @@ def results_page(query: str, results: list[dict], elapsed: float, host: str) -> 
         for r in results:
             url = r["url"]
             full_url = f"http://{host}{unquote(url)}"
+            # badge shows the file extension, e.g. HTML or WEBP
             badge = r["name"].rsplit(".", 1)[-1].upper() if "." in r["name"] else "FILE"
             meta = f'<span class="badge">{html.escape(badge)}</span>{html.escape(r["type"])} &middot; {human_size(r["size"])}'
             if r["type"].startswith("image/"):
+                # the browser fetches this thumbnail over its own connection
                 thumb = f'<a href="{url}"><img class="thumb" src="{url}" alt="{html.escape(r["name"])}" loading="lazy"></a>'
                 snip = f'Image file. Click to open <b>{html.escape(r["name"])}</b> in the browser.'
             else:
@@ -392,22 +369,22 @@ def results_page(query: str, results: list[dict], elapsed: float, host: str) -> 
 
 
 def error_page(code: str, message: str) -> bytes:
+    # `message` may contain markup, so callers must escape any user input in it
     return page(code, "serp",
                 f'<header class="top"><a href="/">{LOGO}</a>{search_box()}</header>'
                 f'<div class="results"><h2>{html.escape(code)}</h2><p>{message}</p>'
                 f'<p><a href="/search?q=">See every file on this server</a></p></div>')
 
 
-# --------------------------------------------------------------------------
-# One request in, one response out
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------- request handling
 
 def route(method: str, url_path: str, host: str) -> tuple[bytes, str]:
-    """Decide what to send back. Returns (raw response bytes, log line)."""
+    """Pick a response for one request. Returns (raw response bytes, log line)."""
     if method != "GET":
         body = error_page("405 Method Not Allowed", "This server only speaks GET.")
         return build_response("HTTP/1.1 405 Method Not Allowed", body), f"405 Method Not Allowed (method={method})"
 
+    # split "/search?q=cat" into the path and the query string
     path, _, query_string = url_path.partition("?")
     params = parse_qs(query_string, keep_blank_values=True)
     query = params.get("q", [""])[0].strip()
@@ -427,17 +404,18 @@ def route(method: str, url_path: str, host: str) -> tuple[bytes, str]:
                     f"200 OK  JSON search q={query!r} -> {len(results)} result(s)")
 
         if path == "/lucky" and results:
+            # the redirect is just the Location header; the browser makes the next request
             target = results[0]["url"]
             body = f'<p>Redirecting to <a href="{target}">{target}</a></p>'.encode()
             return (build_response("HTTP/1.1 302 Found", body, extra_headers={"Location": target}),
                     f"302 Found  lucky q={query!r} -> {target}")
 
+        # also reached by /lucky with no results: show the empty results page
         body = results_page(query, results, elapsed, host)
         return (build_response("HTTP/1.1 200 OK", body),
                 f"200 OK  search q={query!r} -> {len(results)} result(s)")
 
-    # Anything else is a plain file request -- this is what a click on a
-    # search result sends.
+    # anything else is a plain file request, e.g. from clicking a result
     file_path = resolve_path(path)
     if file_path is None:
         body = error_page("403 Forbidden", "That path is outside the web root.")
@@ -445,7 +423,7 @@ def route(method: str, url_path: str, host: str) -> tuple[bytes, str]:
 
     try:
         if file_path.suffix.lower() in SKIP_SUFFIXES:
-            raise PermissionError        # do not hand out our own source code
+            raise PermissionError        # treated as 404 below so source files stay private
         body = file_path.read_bytes()
         ctype = guess_type(file_path)
         return (build_response("HTTP/1.1 200 OK", body, ctype),
@@ -456,11 +434,10 @@ def route(method: str, url_path: str, host: str) -> tuple[bytes, str]:
 
 
 def handle_client(conn: socket.socket, addr: tuple) -> None:
-    """Serve exactly one client, then close the connection."""
+    """Serve one request on this connection, then close it."""
     print(f"\n[+] Connection from {addr[0]}:{addr[1]}")
-    # Browsers sometimes open a spare connection and send nothing on it. On a
-    # single-threaded server that would block everyone, so give up after a
-    # few seconds of silence.
+    # browsers sometimes open a spare connection and never send on it;
+    # the timeout keeps that from blocking the single-threaded loop
     conn.settimeout(CLIENT_TIMEOUT)
     try:
         header_text = receive_request_headers(conn)
@@ -468,7 +445,7 @@ def handle_client(conn: socket.socket, addr: tuple) -> None:
             print("    (client sent nothing)")
             return
 
-        # The first header line is the request line, e.g. "GET /search?q=cat HTTP/1.1"
+        # first line looks like "GET /search?q=cat HTTP/1.1"
         request_line = header_text.split("\r\n")[0]
         print(f"    Request : {request_line}")
 
@@ -491,10 +468,10 @@ def handle_client(conn: socket.socket, addr: tuple) -> None:
 
 
 def get_local_ip() -> str:
-    """Return this machine's LAN IP so we can print a helpful address."""
+    """This machine's LAN IP, used for the startup message."""
     try:
-        # Trick: "connect" a UDP socket to an external address. No data is sent,
-        # but the OS picks the network interface it would use, and we read its IP.
+        # connecting a UDP socket sends nothing, but makes the OS pick the
+        # outgoing interface, whose address we then read back
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
@@ -506,12 +483,11 @@ def main() -> None:
     ip = get_local_ip()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        # Allow an immediate restart without "Address already in use"
+        # lets us restart right away without "Address already in use"
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((HOST, PORT))
-        server_socket.listen(5)          # queue up to 5 pending connections
-        # Wake up once a second so Ctrl+C works on Windows too (a plain
-        # blocking accept() ignores Ctrl+C there).
+        server_socket.listen(5)          # backlog of 5 waiting connections
+        # accept() times out every second so Ctrl+C is noticed on Windows
         server_socket.settimeout(1.0)
 
         files = list_server_files()
@@ -526,13 +502,12 @@ def main() -> None:
 
         try:
             while True:
-                # accept() blocks until a client connects, then hands us a NEW
-                # socket dedicated to that one client.
                 try:
+                    # accept() returns a new socket for this one client
                     conn, addr = server_socket.accept()
                 except socket.timeout:
-                    continue                 # nobody connected this second
-                handle_client(conn, addr)    # single-threaded: one client at a time
+                    continue
+                handle_client(conn, addr)    # one client at a time
         except KeyboardInterrupt:
             print("\n[*] Server stopped.")
 
